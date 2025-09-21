@@ -41,96 +41,176 @@ def build_model(backbone_name='clip', img_size=224, num_classes=9):
     model = ClassifierModel(bb, n_classes=num_classes).to(DEVICE)
     return model
 
-def train_teacher(data_dir, save_dir, epochs=10, batch_size=32, img_size=224, status:Optional[TrainingStatus]=None):
+def _evaluate_model_on_loader(model, loader):
+    model.eval()
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for imgs, labels, _ in loader:
+            imgs = imgs.to(DEVICE)
+            logits, _ = model(imgs)
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            y_pred.extend(preds.tolist())
+            y_true.extend(labels.numpy().tolist())
+    if len(y_true) == 0:
+        return {"accuracy":0.0, "n":0}
+    acc = accuracy_score(y_true, y_pred)
+    return {"accuracy": float(acc), "n": len(y_true)}
+
+def train_teacher(data_dir, save_dir, epochs=10, batch_size=32, img_size=224, status:Optional[TrainingStatus]=None, image_root:Optional[str]=None):
     os.makedirs(save_dir, exist_ok=True)
     model = build_model(backbone_name='clip', img_size=img_size)
+    model.to(DEVICE)
     opt = optim.AdamW(model.parameters(), lr=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=3, verbose=True)
     criterion = SoftCrossEntropy()
-    loader = make_loader(data_dir, subset='train', modality='oct', img_size=img_size, batch_size=batch_size)
+
+    train_loader = make_loader(data_dir, subset='train', modality='oct', img_size=img_size, batch_size=batch_size, image_root=image_root, shuffle=True)
+    val_loader = make_loader(data_dir, subset='dev', modality='oct', img_size=img_size, batch_size=batch_size, image_root=image_root, shuffle=False)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE!='cpu'))
     model.train()
-    best_loss = 1e9
+    best_val_acc = 0.0
     for epoch in range(epochs):
         running=0.0
         if status and status.stop:
             print("Stop requested — exiting teacher training early.")
             break
-        for imgs, labels, _ in tqdm(loader, desc=f"Teacher Epoch {epoch+1}/{epochs}"):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Teacher Epoch {epoch+1}/{epochs}")
+        for imgs, labels, _ in pbar:
             if status and status.stop:
                 break
             imgs = imgs.to(DEVICE)
             labels = labels.to(DEVICE)
             opt.zero_grad()
-            logits, feats = model(imgs)
-            loss = criterion(logits, labels)
-            loss.backward()
-            opt.step()
+            with torch.cuda.amp.autocast(enabled=(DEVICE!='cpu')):
+                logits, feats = model(imgs)
+                loss = criterion(logits, labels)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             running += loss.item()
-        avg = running/len(loader) if len(loader)>0 else 0.0
+            pbar.set_postfix({'loss': f"{running/((pbar.n or 1)):0.4f}"})
+
+        avg = running/len(train_loader) if len(train_loader)>0 else 0.0
         if status:
             status.phase='teacher'; status.epoch=epoch+1; status.loss=avg
-        print(f"Epoch {epoch+1} loss={avg:.4f}")
-        if avg < best_loss:
-            best_loss = avg
+        print(f"Epoch {epoch+1} train loss={avg:.4f}")
+
+        # validation
+        val_metrics = _evaluate_model_on_loader(model, val_loader)
+        val_acc = val_metrics.get('accuracy', 0.0)
+        print(f"Epoch {epoch+1} val accuracy={val_acc*100:.2f}%")
+        # scheduler step on validation loss proxy (here 1-acc)
+        scheduler.step(1.0 - val_acc if val_acc>0 else 1.0)
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             save_checkpoint(model, os.path.join(save_dir,'best_teacher.pth'))
+            print(f"Saved best_teacher.pth (val_acc={best_val_acc*100:.2f}%)")
+
     save_checkpoint(model, os.path.join(save_dir,'last_teacher.pth'))
     return os.path.join(save_dir,'best_teacher.pth')
 
-def train_student(data_dir, teacher_ckpt, save_dir, epochs=10, batch_size=32, img_size=224, alpha=0.6, beta=0.05, status:Optional[TrainingStatus]=None):
+def train_student(data_dir, teacher_ckpt, save_dir, epochs=10, batch_size=32, img_size=224, alpha=0.6, beta=0.05, status:Optional[TrainingStatus]=None, image_root:Optional[str]=None):
     os.makedirs(save_dir, exist_ok=True)
     teacher = build_model(backbone_name='clip', img_size=224)
     teacher = load_checkpoint(teacher, teacher_ckpt)
+    teacher.to(DEVICE)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad=False
+
     student = build_model(backbone_name='fallback', img_size=img_size)
+    student.to(DEVICE)
     student.train()
     opt = optim.AdamW(student.parameters(), lr=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=3, verbose=True)
     cls_criterion = SoftCrossEntropy()
-    loader = make_loader(data_dir, subset='train', modality='fundus', img_size=img_size, batch_size=batch_size)
-    best_loss=1e9
+
+    train_loader = make_loader(data_dir, subset='train', modality='fundus', img_size=img_size, batch_size=batch_size, image_root=image_root, shuffle=True)
+    val_loader = make_loader(data_dir, subset='dev', modality='fundus', img_size=img_size, batch_size=batch_size, image_root=image_root, shuffle=False)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE!='cpu'))
+    best_val_acc = 0.0
     for epoch in range(epochs):
         running=0.0
         if status and status.stop:
             print("Stop requested — exiting student training early.")
             break
-        for imgs, labels, _ in tqdm(loader, desc=f"Student Epoch {epoch+1}/{epochs}"):
+        student.train()
+        pbar = tqdm(train_loader, desc=f"Student Epoch {epoch+1}/{epochs}")
+        for imgs, labels, _ in pbar:
             if status and status.stop:
                 break
             imgs = imgs.to(DEVICE)
             labels = labels.to(DEVICE)
-            student_logits, student_feats = student(imgs)
-            with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=(DEVICE!='cpu')):
+                student_logits, student_feats = student(imgs)
+                # teacher on resized input
                 t_in = nn.functional.interpolate(imgs, size=(224,224), mode='bilinear', align_corners=False)
                 t_logits, t_feats = teacher(t_in)
-            cls_loss = cls_criterion(student_logits, labels)
-            gpd = global_prototypical_distillation(student_feats, t_feats, labels, num_classes=9)
-            lcd = local_contrastive_distillation(student_feats, t_feats, labels)
-            loss = cls_loss + alpha * gpd + beta * lcd
+                cls_loss = cls_criterion(student_logits, labels)
+                gpd = global_prototypical_distillation(student_feats, t_feats, labels, num_classes=9)
+                lcd = local_contrastive_distillation(student_feats, t_feats, labels)
+                loss = cls_loss + alpha * gpd + beta * lcd
+
             opt.zero_grad()
-            loss.backward()
-            opt.step()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             running += loss.item()
-        avg = running/len(loader) if len(loader)>0 else 0.0
+            pbar.set_postfix({'loss': f"{running/((pbar.n or 1)):0.4f}"})
+
+        avg = running/len(train_loader) if len(train_loader)>0 else 0.0
         if status:
             status.phase='student'; status.epoch=epoch+1; status.loss=avg
-        print(f"Epoch {epoch+1} loss={avg:.4f}")
-        if avg < best_loss:
-            best_loss = avg
+        print(f"Epoch {epoch+1} train loss={avg:.4f}")
+
+        # validation
+        val_metrics = _evaluate_model_on_loader(student, val_loader)
+        val_acc = val_metrics.get('accuracy', 0.0)
+        print(f"Epoch {epoch+1} val accuracy={val_acc*100:.2f}%")
+        scheduler.step(1.0 - val_acc if val_acc>0 else 1.0)
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             save_checkpoint(student, os.path.join(save_dir,'best_student.pth'))
+            print(f"Saved best_student.pth (val_acc={best_val_acc*100:.2f}%)")
+
     save_checkpoint(student, os.path.join(save_dir,'last_student.pth'))
     return os.path.join(save_dir,'best_student.pth')
 
 def start_teacher_training(data_dir, epochs, batch_size, status, extra):
     print('Starting teacher training...')
     status.phase='teacher'; status.epoch=0; status.loss=0.0; status.stop=False
-    ckpt = train_teacher(data_dir, save_dir=extra.get('save_dir','./checkpoints/teacher'), epochs=epochs, batch_size=batch_size, img_size=extra.get('img_size',224), status=status)
+    ckpt = train_teacher(
+        data_dir,
+        save_dir=extra.get('save_dir','./checkpoints/teacher'),
+        epochs=epochs,
+        batch_size=batch_size,
+        img_size=extra.get('img_size',224),
+        status=status,
+        image_root=extra.get('image_root')
+    )
     status.history['train'].append({'phase':'teacher','ckpt':ckpt})
     return ckpt
 
 def start_student_training(data_dir, epochs, batch_size, status, extra):
     print('Starting student training...')
     status.phase='student'; status.epoch=0; status.loss=0.0; status.stop=False
-    ckpt = train_student(data_dir, teacher_ckpt=extra.get('teacher_ckpt'), save_dir=extra.get('save_dir','./checkpoints/student'), epochs=epochs, batch_size=batch_size, img_size=extra.get('img_size',224), alpha=extra.get('alpha',0.6), beta=extra.get('beta',0.05), status=status)
+    ckpt = train_student(
+        data_dir,
+        teacher_ckpt=extra.get('teacher_ckpt'),
+        save_dir=extra.get('save_dir','./checkpoints/student'),
+        epochs=epochs,
+        batch_size=batch_size,
+        img_size=extra.get('img_size',224),
+        alpha=extra.get('alpha',0.6),
+        beta=extra.get('beta',0.05),
+        status=status,
+        image_root=extra.get('image_root')
+    )
     status.history['train'].append({'phase':'student','ckpt':ckpt})
     return ckpt
 
@@ -147,12 +227,12 @@ def predict_image(image_bytes, modality='fundus', model_path=None):
         pred = torch.argmax(logits, dim=1).item()
     return int(pred)
 
-def evaluate_model(model_path: str, data_dir: str, subset: str = 'dev', modality: str = 'fundus', img_size: int = 224, batch_size: int = 32, analysis_dir: str = './analysis') -> Dict:
+def evaluate_model(model_path: str, data_dir: str, subset: str = 'dev', modality: str = 'fundus', img_size: int = 224, batch_size: int = 32, analysis_dir: str = './analysis', image_root:Optional[str]=None) -> Dict:
     os.makedirs(analysis_dir, exist_ok=True)
     model = load_checkpoint(build_model(backbone_name='fallback', img_size=img_size), model_path)
     model.to(DEVICE)
     model.eval()
-    loader = make_loader(data_dir, subset=subset, modality=modality, img_size=img_size, batch_size=batch_size, shuffle=False)
+    loader = make_loader(data_dir, subset=subset, modality=modality, img_size=img_size, batch_size=batch_size, shuffle=False, image_root=image_root)
     y_true, y_pred, feats_all = [], [], []
     with torch.no_grad():
         for imgs, labels, _ in tqdm(loader, desc=f"Evaluate {subset}"):
@@ -186,6 +266,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="MultiEYE Training Script")
+    parser.add_argument("--image_root", type=str, default=None,
+                    help="Optional: explicit path to ImageData folder")
     parser.add_argument("--phase", type=str, choices=["teacher", "student"], required=True,
                         help="Training phase: 'teacher' for OCT pretraining, 'student' for Fundus distillation")
     parser.add_argument("--data_dir", type=str, required=True,
@@ -204,10 +286,10 @@ if __name__ == "__main__":
     if args.phase == "teacher":
         img_size = args.img_size or 224
         start_teacher_training(args.data_dir, args.epochs, args.batch_size, status,
-                               extra={"save_dir": args.save_dir, "img_size": img_size})
+                               extra={"save_dir": args.save_dir, "img_size": img_size, "image_root": args.image_root})
     elif args.phase == "student":
         if not args.teacher_ckpt:
             raise ValueError("You must provide --teacher_ckpt when training the student model.")
         img_size = args.img_size or 224
         start_student_training(args.data_dir, args.epochs, args.batch_size, status,
-                               extra={"save_dir": args.save_dir, "img_size": img_size, "teacher_ckpt": args.teacher_ckpt})
+                               extra={"save_dir": args.save_dir, "img_size": img_size, "teacher_ckpt": args.teacher_ckpt, "image_root": args.image_root})
