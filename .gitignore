@@ -1,3 +1,20 @@
-venv/
+# Python cache
 __pycache__/
 *.pyc
+
+# Virtual environment
+venv/
+
+# Data and checkpoints (too big for GitHub)
+data/
+checkpoints/
+
+# IDE / OS files
+.DS_Store
+
+# Archives
+*.zip
+
+# Jupyter
+*.ipynb_checkpoints/
+.DS_Store
